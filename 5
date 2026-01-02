@@ -1,0 +1,101 @@
+Это отличный и очень глубокий разбор. Ты абсолютно прав по всем пунктам: от строгой сигнатуры функций в `scipy.integrate` до порядка аргументов в сферических гармониках. Особенно критична ошибка с `tplquad` — в текущем виде код бы действительно выдавал ошибку или некорректные значения из-за попытки вернуть вектор из подынтегральной функции.
+
+Я переработал класс, внедрив твои правки по интеграции, нормализации и аргументам `sph_harm`. Также я добавил небольшую оптимизацию: теперь `E_total` считается первым и используется для нормализации всех остальных компонент "на лету".
+
+### Обновленный и исправленный код
+
+```python
+import numpy as np
+from scipy.special import sph_harm
+from scipy.integrate import tplquad, dblquad
+
+class EnergySignature:
+    def __init__(self, r0=np.array([0, 0, 0]), t0=0):
+        self.r0 = np.array(r0, dtype=float)
+        self.t0 = t0
+        self.energy_field = None
+        self.current_field = None
+        self.signature = None
+
+    def set_energy_field(self, energy_func):
+        self.energy_field = energy_func
+
+    def set_current_field(self, current_func):
+        self.current_field = current_func
+
+    def _get_total_energy(self, bounds):
+        """Вспомогательный метод для вычисления полной энергии (нормализатора)"""
+        def f(sz, sy, sx):
+            return self.energy_field(np.array([sx, sy, sz]), self.t0)
+        
+        val, _ = tplquad(f, bounds[0], bounds[1], 
+                         lambda x: bounds[0], lambda x: bounds[1],
+                         lambda x, y: bounds[0], lambda x, y: bounds[1])
+        return val
+
+    def compute_signature(self, l_max=3, bounds=(-5, 5), r_sample=2):
+        if self.energy_field is None or self.current_field is None:
+            raise ValueError("Поля должны быть заданы")
+
+        # 1. Считаем полную энергию для нормализации
+        e_total = self._get_total_energy(bounds)
+        norm = abs(e_total) if abs(e_total) > 1e-10 else 1.0
+
+        # 2. Угловой момент (покомпонентно)
+        l_vector = []
+        for i in range(3):
+            def integrand(sz, sy, sx):
+                s = np.array([sx, sy, sz])
+                j = self.current_field(s, self.t0)
+                return np.cross(s, j)[i]
+            
+            val, _ = tplquad(integrand, bounds[0], bounds[1],
+                             lambda x: bounds[0], lambda x: bounds[1],
+                             lambda x, y: bounds[0], lambda x, y: bounds[1])
+            l_vector.append(val / norm)
+
+        # 3. Сферические гармоники
+        # SciPy sph_harm(m, n, theta, phi): theta=[0, 2pi], phi=[0, pi]
+        
+        harmonics = []
+        for l in range(l_max + 1):
+            for m in range(-l, l + 1):
+                def surf_func(phi, theta): # Порядок для dblquad: (y, x) -> (phi, theta)
+                    sx = r_sample * np.sin(theta) * np.cos(phi)
+                    sy = r_sample * np.sin(theta) * np.sin(phi)
+                    sz = r_sample * np.cos(theta)
+                    u = self.energy_field(np.array([sx, sy, sz]), self.t0)
+                    # m, n, azimuthal (0-2pi), polar (0-pi)
+                    y_lm = sph_harm(m, l, phi, theta)
+                    return (u * np.conj(y_lm) * np.sin(theta)).real
+
+                # dblquad(func, x_min, x_max, y_min, y_max) -> func(y, x)
+                # Внешний x=theta (0, pi), внутренний y=phi (0, 2pi)
+                val, _ = dblquad(surf_func, 0, np.pi, 0, 2*np.pi)
+                harmonics.append(val / norm)
+
+        # Собираем финальный вектор: [L_x, L_y, L_z, E_total, ...harmonics...]
+        self.signature = np.concatenate([l_vector, [e_total/norm], harmonics])
+        return self.signature
+
+    def encode(self, precision=2):
+        if self.signature is None: return ""
+        # Кодируем в компактную строку: знак + число
+        return "".join([f"{x:+.{precision}f}" for x in self.signature])
+
+```
+
+### Что изменилось:
+
+1. **Порядок в `sph_harm**`: Теперь `phi` (0–2π) идет третьим аргументом, а `theta` (0–π) — четвертым, как того требует SciPy.
+2. **Интегрирование**: `tplquad` теперь корректно принимает лямбды для границ и работает со скалярными компонентами вектора момента.
+3. **Логика нормализации**: Энергия теперь стоит в центре вектора (как «опорная точка»), а все компоненты делятся на неё сразу. Это делает сигнатуру инвариантной к масштабу интенсивности поля.
+4. **Геометрия**: `dblquad` теперь четко разделяет внутренний цикл по азимуту () и внешний по полярному углу ().
+
+---
+
+### Твоя идея про "читаемый код"
+
+Мне очень нравится мысль про блоки. Мы могли бы превратить эти числа в **Base64** или даже в **символы Unicode**, чтобы сигнатура выглядела как магическая печать или штрих-код.
+
+**Хочешь, я набросаю алгоритм превращения этого вектора в визуальную "глифическую" строку (например, используя блоки Braille или специальные символы)?** Это превратит сухие цифры в настоящий цифровой отпечаток.
