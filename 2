@@ -1,0 +1,231 @@
+Код у тебя очень красивый по идее, но в нём есть несколько важных технических проблем, из‑за которых он либо будет работать не так, как задумано, либо вообще «молча» давать мусор. Пройдусь по ключевым местам и сразу предложу, как поправить.
+
+---
+
+### 1. `tplquad` и векторный интеграл для углового момента
+
+Сейчас:
+
+```python
+def integrand(sx, sy, sz):
+    s = np.array([sx, sy, sz])
+    J = self.current_field(s, self.t0)
+    return np.cross(s, J)
+
+result, _ = tplquad(
+    lambda sz, sy, sx: integrand(sx, sy, sz),
+    s_bounds[0], s_bounds[1],
+    s_bounds[0], s_bounds[1],
+    s_bounds[0], s_bounds[1],
+    epsabs=tolerance, epsrel=tolerance
+)
+return np.array(result)
+```
+
+Проблемы:
+
+- `tplquad` ожидает **скалярную** функцию `func(z, y, x)`, а ты возвращаешь вектор `np.cross(s, J)`.
+- В итоге SciPy либо упадёт, либо возьмёт только один компонент/сделает что‑то странное.
+
+Как правильно — интегрировать **по компонентам**:
+
+```python
+def compute_angular_momentum(self, s_bounds=(-10, 10), tolerance=1e-3):
+    if self.current_field is None:
+        raise ValueError("Сначала нужно задать токовый (потоковый) поле")
+
+    def integrand_component(i):
+        def f(sz, sy, sx):
+            s = np.array([sx, sy, sz])
+            J = self.current_field(s, self.t0)
+            return np.cross(s, J)[i]
+        return f
+
+    L = []
+    for i in range(3):
+        val, _ = tplquad(
+            integrand_component(i),
+            s_bounds[0], s_bounds[1],
+            lambda x: s_bounds[0], lambda x: s_bounds[1],
+            lambda x, y: s_bounds[0], lambda x, y: s_bounds[1],
+            epsabs=tolerance, epsrel=tolerance
+        )
+        L.append(val)
+    return np.array(L)
+```
+
+Обрати внимание на сигнатуру `tplquad(func, a, b, gfun, hfun, qfun, rfun, ...)` — `func(z, y, x)`.
+
+---
+
+### 2. `dblquad` и порядок аргументов
+
+Ты написал свой `dblquad`:
+
+```python
+def dblquad(func, phi_min, phi_max, theta_min, theta_max, epsabs=1e-4, epsrel=1e-4):
+    from scipy.integrate import dblquad as scipy_dblquad
+    result, _ = scipy_dblquad(func, phi_min, phi_max, theta_min, theta_max, 
+                              epsabs=epsabs, epsrel=epsrel)
+    return result, 0
+```
+
+И вызываешь так:
+
+```python
+integral, _ = dblquad(
+    surface_integrand,
+    0, 2*np.pi,  # phi
+    0, np.pi     # theta
+)
+```
+
+У `scipy.integrate.dblquad` сигнатура: `dblquad(func, a, b, gfun, hfun, ...)`, где `func(y, x)`. Ты передаёшь `theta_min, theta_max` как константы — это допустимо, но:
+
+- Внутри `surface_integrand(theta, phi)` ты явно считаешь, что первый аргумент — `theta`, второй — `phi`.
+- А `dblquad` вызывает `func(y, x)`, где `y` — внутренний интеграл, `x` — внешний.
+
+То есть сейчас у тебя **перепутаны роли `theta` и `phi`**. Это не смертельно (просто меняется порядок интегрирования), но лучше быть явным:
+
+```python
+def surface_integrand(phi, theta):
+    sx = r * np.sin(theta) * np.cos(phi)
+    sy = r * np.sin(theta) * np.sin(phi)
+    sz = r * np.cos(theta)
+    s = np.array([sx, sy, sz])
+    return self.energy_field(s, self.t0) * r**2 * np.sin(theta)
+
+integral, _ = dblquad(
+    surface_integrand,
+    0, np.pi,      # theta (внешний)
+    0, 2*np.pi     # phi (внутренний)
+)
+```
+
+И внутри своего `dblquad` лучше явно прокинуть `gfun`, `hfun` как функции, а не как «четвёртый и пятый аргумент без комментариев».
+
+---
+
+### 3. `sph_harm` — порядок аргументов
+
+Документация SciPy:  
+`sph_harm(m, n, theta, phi)` — `theta` в `[0, 2π]`, `phi` в `[0, π]`.
+
+У тебя:
+
+```python
+Y_lm = np.conj(sph_harm(m, l, phi, theta))
+```
+
+То есть ты передаёшь **наоборот**: сначала `phi`, потом `theta`. Это меняет физический смысл разложения — ты фактически разворачиваешь сферу.
+
+Правильно:
+
+```python
+Y_lm = np.conj(sph_harm(m, l, theta, phi))
+```
+
+И следи за тем, чтобы везде в коде у тебя была одна и та же конвенция:  
+`theta` — полярный угол (0..π), `phi` — азимутальный (0..2π), или наоборот, но **последовательно**.
+
+---
+
+### 4. Интеграл полной энергии
+
+Сейчас:
+
+```python
+E_total, _ = tplquad(
+    total_energy_integrand,
+    -10, 10, -10, 10, -10, 10
+)
+```
+
+Это не соответствует сигнатуре `tplquad`. Ты передаёшь 6 чисел, но `tplquad` ожидает:
+
+```python
+tplquad(func, a, b, gfun, hfun, qfun, rfun, ...)
+```
+
+То есть нужно:
+
+```python
+E_total, _ = tplquad(
+    lambda sz, sy, sx: total_energy_integrand(sx, sy, sz),
+    -10, 10,
+    lambda x: -10, lambda x: 10,
+    lambda x, y: -10, lambda x, y: 10
+)
+```
+
+Иначе интеграл либо не посчитается, либо посчитается не по тому, что ты думаешь.
+
+---
+
+### 5. Нормализация и позиция `E_total` в векторе
+
+В `normalize_signature` ты предполагаешь, что **последний элемент** — это `E_total`:
+
+```python
+E_total = self.signature[-1]
+self.signature = self.signature / abs(E_total)
+```
+
+Но в `compute_signature` ты сначала добавляешь:
+
+```python
+signature_vector.extend(L)      # 3 компоненты L
+signature_vector.append(E_total)
+# потом для каждого (l, m) добавляешь real, imag
+```
+
+То есть **последний элемент — это imag последнего коэффициента**, а не энергия. Нормализация сейчас делится на что‑то другое.
+
+Исправить можно так:
+
+- Либо хранить индекс энергии явно,
+- Либо нормализовать до добавления коэффициентов:
+
+```python
+# до добавления c_lm
+signature_vector.extend(L)
+signature_vector.append(E_total)
+base = np.array(signature_vector)
+
+if abs(E_total) > 1e-10:
+    base = base / abs(E_total)
+
+# потом уже добавлять нормализованные c_lm (тоже можно делить на |E_total|)
+```
+
+Или завести структуру:
+
+```python
+self.E_total_index = 3  # после трёх компонент L
+```
+
+и использовать её.
+
+---
+
+### 6. Идеи по улучшению без ломки архитектуры
+
+Кратко:
+
+- **Ограничить область интегрирования** не жёстко `[-10, 10]`, а, например, параметром `R`, зависящим от поля (для гаусса достаточно 3–4 σ).
+- **Сделать `l_max` и радиусы параметрами класса**, чтобы можно было легко сравнивать сигнатуры, построенные с одинаковыми настройками.
+- **Добавить метод сравнения сигнатур**, например:
+
+  ```python
+  def distance_to(self, other):
+      return np.linalg.norm(self.normalize_signature() - other.normalize_signature())
+  ```
+
+- **Добавить тесты на простых полях**, где ты знаешь ожидаемый результат (например, чисто осесимметричное поле → только \(m=0\) и т.д.).
+
+---
+
+Если хочешь, можем следующим шагом:
+
+- Аккуратно переписать `compute_angular_momentum` и `compute_signature` с учётом всех этих правок,
+- А потом придумать формат «читаемого» кода (например, блоки по 4 числа → символ), чтобы твой сигнатурный вектор реально превращался в компактный «знак» для каждого поля/существа.
