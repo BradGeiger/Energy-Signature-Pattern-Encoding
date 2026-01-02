@@ -1,0 +1,250 @@
+
+import numpy as np
+from scipy.special import sph_harm
+from scipy.integrate import tplquad, dblquad
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+class EnergySignature:
+    def __init__(self, r0=np.array([0, 0, 0]), t0=0):
+        """
+        初始化能量签名系统
+        :param r0: 中心点位置
+        :param t0: 参考时间
+        """
+        self.r0 = np.array(r0, dtype=float)
+        self.t0 = t0
+        self.energy_field = None
+        self.current_field = None
+        self.signature = None
+
+    def set_energy_field(self, energy_func):
+        """
+        设置能量密度场函数 u(s, t)
+        :param energy_func: 函数接收(s, t)返回能量密度
+        """
+        self.energy_field = energy_func
+
+    def set_current_field(self, current_func):
+        """
+        设置能量流场函数 J(s, t)
+        :param current_func: 函数接收(s, t)返回流密度向量
+        """
+        self.current_field = current_func
+
+    def compute_velocity_field(self, s, t):
+        """
+        计算速度场 v(s, t) = J(s, t) / u(s, t)
+        """
+        if self.energy_field is None or self.current_field is None:
+            raise ValueError("能量场和流场必须先设置")
+        u = self.energy_field(s, t)
+        J = self.current_field(s, t)
+        # 避免除零
+        u_safe = np.where(np.abs(u) > 1e-10, u, 1e-10)
+        return J / u_safe
+
+    def compute_angular_momentum(self, s_bounds=(-10, 10), tolerance=1e-3):
+        """
+        计算相对于中心点的总角动量 L(t0)
+        :param s_bounds: 积分范围
+        :param tolerance: 积分精度
+        """
+        if self.current_field is None:
+            raise ValueError("需要先设置流场")
+            
+        def integrand_component(i):
+            def f(sz, sy, sx):
+                s = np.array([sx, sy, sz])
+                J = self.current_field(s, self.t0)
+                return np.cross(s, J)[i]
+            return f
+
+        L = []
+        for i in range(3):
+            val, _ = tplquad(
+                integrand_component(i),
+                s_bounds[0], s_bounds[1],
+                lambda x: s_bounds[0], lambda x: s_bounds[1],
+                lambda x, y: s_bounds[0], lambda x, y: s_bounds[1],
+                epsabs=tolerance, epsrel=tolerance
+            )
+            L.append(val)
+        return np.array(L)
+
+    def radial_energy_profile(self, r_max=10, num_points=100):
+        """
+        计算径向能量分布 U(r)
+        :param r_max: 最大半径
+        :param num_points: 径向采样点数
+        """
+        if self.energy_field is None:
+            raise ValueError("需要先设置能量场")
+            
+        r_values = np.linspace(0.01, r_max, num_points)  # 避免r=0
+        U_values = []
+        
+        for r in r_values:
+            def surface_integrand(phi, theta):
+                sx = r * np.sin(theta) * np.cos(phi)
+                sy = r * np.sin(theta) * np.sin(phi)
+                sz = r * np.cos(theta)
+                s = np.array([sx, sy, sz])
+                return self.energy_field(s, self.t0) * r**2 * np.sin(theta)
+            
+            integral, _ = dblquad(
+                surface_integrand,
+                0, 2*np.pi,    # phi (内层积分)
+                lambda x: 0, lambda x: np.pi  # theta (外层积分)
+            )
+            U_values.append(integral)
+        
+        return r_values, np.array(U_values)
+
+    def spherical_harmonic_expansion(self, l_max=5, r_sample=5):
+        """
+        在固定半径处进行球谐函数展开
+        :param l_max: 最大球谐次数
+        :param r_sample: 采样半径
+        """
+        if self.energy_field is None:
+            raise ValueError("需要先设置能量场")
+            
+        coefficients = {}
+        
+        for l in range(l_max + 1):
+            for m in range(-l, l + 1):
+                def integrand(phi, theta):
+                    sx = r_sample * np.sin(theta) * np.cos(phi)
+                    sy = r_sample * np.sin(theta) * np.sin(phi)
+                    sz = r_sample * np.cos(theta)
+                    s = np.array([sx, sy, sz])
+                    u_val = self.energy_field(s, self.t0)
+                    # 注意: sph_harm(m, l, theta, phi) - theta和phi顺序
+                    Y_lm = np.conj(sph_harm(m, l, theta, phi))
+                    return u_val * Y_lm * np.sin(theta)
+                
+                integral, _ = dblquad(
+                    integrand,
+                    0, 2*np.pi,    # phi (内层积分)
+                    lambda x: 0, lambda x: np.pi  # theta (外层积分)
+                )
+                coefficients[(l, m)] = integral
+        
+        return coefficients
+
+    def compute_signature(self, l_max=3):
+        """
+        计算紧凑特征签名向量 S
+        """
+        # 1. 总角动量
+        L = self.compute_angular_momentum()
+        
+        # 2. 总能量
+        def total_energy_integrand(sz, sy, sx):
+            s = np.array([sx, sy, sz])
+            return self.energy_field(s, self.t0)
+        
+        E_total, _ = tplquad(
+            total_energy_integrand,
+            -10, 10,
+            lambda x: -10, lambda x: 10,
+            lambda x, y: -10, lambda x, y: 10
+        )
+        
+        # 3. 球谐系数
+        coeffs = self.spherical_harmonic_expansion(l_max=l_max)
+        
+        # 4. 构建特征向量 (按正确顺序)
+        signature_vector = []
+        signature_vector.extend(L)  # 角动量分量 (3个元素)
+        
+        # 添加球谐系数(实部和虚部) - 在总能量之前
+        for l in range(l_max + 1):
+            for m in range(-l, l + 1):
+                coeff = coeffs[(l, m)]
+                signature_vector.append(coeff.real)
+                signature_vector.append(coeff.imag)
+                
+        # 总能量作为最后一个元素
+        signature_vector.append(E_total)
+        
+        self.signature = np.array(signature_vector)
+        return self.signature
+
+    def normalize_signature(self):
+        """
+        归一化签名向量(形状标准化) - 正确使用最后一个元素作为总能量
+        """
+        if self.signature is None:
+            raise ValueError("先计算签名向量")
+        # 最后一个元素是总能量
+        E_total = self.signature[-1]
+        if abs(E_total) > 1e-10:
+            self.signature = self.signature / abs(E_total)
+        return self.signature
+
+    def encode_signature(self, precision=3):
+        """
+        将签名向量编码为字符串
+        :param precision: 小数点精度
+        """
+        if self.signature is None:
+            raise ValueError("先计算签名向量")
+        normalized = self.normalize_signature()
+        # 四舍五入并转换为字符串
+        rounded = np.round(normalized, precision)
+        str_components = [f"{x:+.3f}" for x in rounded]
+        return "".join(str_components)
+
+# 示例使用
+if __name__ == "__main__":
+    # 创建能量签名系统
+    signature_system = EnergySignature(r0=[0, 0, 0], t0=0)
+    
+    # 定义示例能量场(高斯分布)
+    def example_energy_field(s, t):
+        r = np.linalg.norm(s)
+        return np.exp(-r**2 / 2)
+    
+    # 定义示例流场(旋转流)
+    def example_current_field(s, t):
+        x, y, z = s
+        # 简单的涡旋流场
+        Jx = -y * np.exp(-np.linalg.norm(s)**2 / 2)
+        Jy = x * np.exp(-np.linalg.norm(s)**2 / 2)
+        Jz = 0
+        return np.array([Jx, Jy, Jz])
+    
+    # 设置场函数
+    signature_system.set_energy_field(example_energy_field)
+    signature_system.set_current_field(example_current_field)
+    
+    # 计算签名
+    try:
+        signature = signature_system.compute_signature(l_max=2)
+        print("原始签名向量:")
+        print(signature)
+        print(f"签名向量长度: {len(signature)}")
+        
+        # 归一化
+        normalized = signature_system.normalize_signature()
+        print("\n归一化签名向量:")
+        print(normalized)
+        
+        # 编码为字符串
+        encoded = signature_system.encode_signature()
+        print("\n编码签名:")
+        print(encoded)
+        
+        # 计算角动量
+        L = signature_system.compute_angular_momentum()
+        print("\n总角动量:")
+        print(L)
+        
+        print("\n系统运行正常!")
+        
+    except Exception as e:
+        print(f"计算过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
